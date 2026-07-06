@@ -74,10 +74,6 @@ git checkout lm/fix/<name> -- $f
 git log $prev_branch..lm/fix/<name> --patch -- $f
 ```
 
-## Exemptions
-
-To exempt deliberate code, put `[tknostyle]` in the message of the commit that authors those lines; `codestyle.py` blames each line and drops tagged ones from all checks (only add tags when the user allows it).
-
 REMINDER.
 This is a broad heuristic capturing our preferences.
 We do not need 100% adherence.
@@ -86,3 +82,7 @@ HOWEVER: prefer to treat errors as style debt to fix.
 After fixing codestyle errors, report to the user.
 What did you change? Did you possibly reward-hack?
 Did you capture the spirit of our guidelines?
+
+Exemptions.
+To exempt deliberate code, put `[tknostyle]` in the message of the commit that authors those lines; 
+`codestyle.py` blames each line and drops tagged ones from all checks (only add tags when the user allows it).
