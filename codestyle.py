@@ -13,7 +13,7 @@ import math
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from radon.complexity import cc_visit
@@ -22,7 +22,7 @@ from radon.raw import analyze
 from rich.console import Console
 from rich.table import Table
 
-STYLE_ALLOW_RE = re.compile(r"^\s*Style-Allow:\s*([A-Za-z_][\w]*)", re.MULTILINE)
+NOSTYLE_TAG = "[tknostyle]"
 
 BANNER_RE = re.compile(r"^\s*#\s*[-=]{3,}")
 PATH_HACK_RE = re.compile(
@@ -648,107 +648,70 @@ def git_lines(args: list[str]) -> list[str]:
     return proc.stdout.splitlines()
 
 
-def commit_waivers(sha: str) -> set[str]:
-    body = "\n".join(git_lines(["show", "-s", "--format=%B", sha]))
-    return set(STYLE_ALLOW_RE.findall(body))
+def commit_is_tagged(sha: str, cache: dict[str, bool]) -> bool:
+    if sha not in cache:
+        body = "\n".join(git_lines(["show", "-s", "--format=%B", sha]))
+        cache[sha] = NOSTYLE_TAG in body
+    return cache[sha]
 
 
-def line_commits(path: Path) -> dict[int, str]:
-    out: dict[int, str] = {}
+# lines authored by a [tknostyle] commit are exempt from all checks; latest
+# blame wins, so a later untagged edit re-arms the line
+def exempt_lines(path: Path) -> set[int]:
     lineno = 0
+    tagged: set[int] = set()
+    cache: dict[str, bool] = {}
     for line in git_lines(["blame", "-p", "HEAD", "--", str(path)]):
         head = line.split(" ")
         if len(head) >= 3 and len(head[0]) == 40 and head[0].isalnum():
             lineno = int(head[2])
-            out[lineno] = head[0]
-    return out
+            if commit_is_tagged(head[0], cache):
+                tagged.add(lineno)
+    return tagged
 
 
-def is_ancestor(sha: str, trust_ref: str) -> bool:
-    return subprocess.run(
-        ["git", "merge-base", "--is-ancestor", sha, trust_ref]
-    ).returncode == 0
+def issue_line(text: str) -> int | None:
+    m = re.search(r"L(\d+)", text)
+    return int(m.group(1)) if m else None
 
 
-def reachable(trust_ref: str, shas: set[str]) -> set[str]:
-    return {sha for sha in shas if is_ancestor(sha, trust_ref)}
+def fn_covered(fn: FunctionMetric, exempt: set[int]) -> bool:
+    return set(range(fn.line, fn.line + max(fn.loc, 1))) <= exempt
 
 
-def trusted_lines(path: Path, trust_ref: str) -> dict[int, set[str]]:
-    blame = line_commits(path)
-    shas = set(blame.values())
-    trusted = reachable(trust_ref, shas)
-    waivers = {sha: commit_waivers(sha) for sha in trusted}
-    return {ln: waivers.get(sha, set()) for ln, sha in blame.items()}
+def issue_kept(text: str, exempt: set[int]) -> bool:
+    ln = issue_line(text)
+    return ln is None or ln not in exempt
 
 
-def issue_lines(issues: list[str]) -> list[int]:
-    out: list[int] = []
-    for text in issues:
-        if m := re.search(r"L(\d+)", text):
-            out.append(int(m.group(1)))
-    return out
+def max_line_length(lines: list[str], exempt: set[int]) -> int:
+    kept = (len(line) for i, line in enumerate(lines, 1) if i not in exempt)
+    return max(kept, default=0)
 
 
-def over_target(attr: str):
-    return lambda fn, name: getattr(fn, attr) > LIMITS[name].target
-
-
-FN_METRIC_PREDS = {
-    "cyclomatic": over_target("cc"),
-    "cognitive": over_target("cognitive"),
-    "nesting": over_target("nesting"),
-    "fn_loc": over_target("loc"),
-    "impure_fns": lambda fn, name: not fn.pure,
-    "hidden_global_fns": lambda fn, name: any(
-        "hidden global read" in r for r in fn.reasons
-    ),
-}
-
-
-def function_anchors(result: Analysis) -> dict[str, list[int]]:
-    fns = result.functions
-    anchors = {
-        name: [fn.line for fn in fns if pred(fn, name)]
-        for name, pred in FN_METRIC_PREDS.items()
+def filter_exempt(result: Analysis, lines: list[str], exempt: set[int]) -> Analysis:
+    if not exempt:
+        return result
+    kept_fns = [fn for fn in result.functions if not fn_covered(fn, exempt)]
+    kept_issues = {
+        name: [t for t in texts if issue_kept(t, exempt)]
+        for name, texts in result.issues.items()
     }
-    anchors["shallow_fns"] = [f.line for f in shallow_functions(fns)]
-    return anchors
+    return replace(
+        result,
+        functions=kept_fns,
+        issues=kept_issues,
+        max_line=max_line_length(lines, exempt),
+    )
 
 
-def offending_lines(result: Analysis, lines: list[str]) -> dict[str, list[int]]:
-    anchors = function_anchors(result)
-    anchors["line_length"] = [
-        i for i, line in enumerate(lines, 1)
-        if len(line) == result.max_line > LIMITS["line_length"].target
-    ]
-    for key, texts in result.issues.items():
-        anchors[key] = issue_lines(texts)
-    return {name: sorted(set(v)) for name, v in anchors.items() if v}
-
-
-def acknowledged_metrics(
-    path: Path, anchors: dict[str, list[int]], trust_ref: str
-) -> dict[str, list[int]]:
-    allow = trusted_lines(path, trust_ref)
-    out: dict[str, list[int]] = {}
-    for name, charged in anchors.items():
-        if charged and all(name in allow.get(ln, ()) for ln in charged):
-            out[name] = charged
-    return out
-
-
-def score(
-    result: Analysis, acknowledged: dict[str, list[int]] | None = None
-) -> tuple[dict[str, float], list[str]]:
+def score(result: Analysis) -> tuple[dict[str, float], list[str]]:
     details = score_functions(result.functions) | score_file(result)
     details |= {
         name: cost(name, val)
         for name, val in metric_values(result).items()
     }
     details["ruff"] = ruff_cost(result.ruff)
-    for name in acknowledged or {}:
-        details[name] = 0.0
     hard = [name for name, value in details.items() if math.isinf(value)]
     return details, hard
 
@@ -924,65 +887,34 @@ def function_table(result: Analysis) -> Table:
     return table
 
 
-def parse_args(argv: list[str]) -> tuple[Path | None, str | None]:
-    trust_ref = None
-    rest = []
-    it = iter(argv[1:])
-    for arg in it:
-        if arg == "--trust-ref":
-            trust_ref = next(it, None)
-        else:
-            rest.append(arg)
-    return (Path(rest[0]) if rest else None), trust_ref
-
-
-def acknowledged_report(acknowledged: dict[str, list[int]]) -> list[str]:
-    return [
-        f"ACK {name}: {', '.join(f'L{ln}' for ln in at)} (Style-Allow, trusted)"
-        for name, at in sorted(acknowledged.items())
-    ]
-
-
-def run(target: Path, trust_ref: str | None) -> tuple[dict[str, float], list[str], dict[str, list[int]], Analysis]:
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print("Usage: uv run --script codestyle.py <file.py>", file=sys.stderr)
+        return 2
+    target = Path(argv[1])
+    if not target.exists():
+        print(f"File not found: {target}", file=sys.stderr)
+        return 2
     source = target.read_text()
     ruff = subprocess.run(
         ["uvx", "ruff", "check", "--select", "I,F401,F841",
          "--output-format", "json", str(target)],
         capture_output=True, text=True,
     )
-    result = analyze_source(target, source, parse_ruff(ruff.stdout))
-    lines = source.splitlines()
-    acknowledged = {}
-    if trust_ref:
-        anchors = offending_lines(result, lines)
-        acknowledged = acknowledged_metrics(target, anchors, trust_ref)
-    details, hard = score(result, acknowledged)
-    return details, hard, acknowledged, result
-
-
-def report(
-    console: Console, result: Analysis,
-    details: dict[str, float], acknowledged: dict[str, list[int]],
-) -> None:
+    exempt = exempt_lines(target)
+    result = filter_exempt(
+        analyze_source(target, source, parse_ruff(ruff.stdout)),
+        source.splitlines(),
+        exempt,
+    )
+    details, hard = score(result)
+    console = Console()
     for item in (summary_table(result), score_table(details), function_table(result)):
         console.print(item)
     for hint in hints(result):
         console.print(f"  > {hint}")
-    for line in acknowledged_report(acknowledged):
-        console.print(f"  ~ {line}")
-
-
-def main(argv: list[str]) -> int:
-    target, trust_ref = parse_args(argv)
-    if target is None:
-        print("Usage: uv run --script codestyle.py [--trust-ref REF] <file.py>", file=sys.stderr)
-        return 2
-    if not target.exists():
-        print(f"File not found: {target}", file=sys.stderr)
-        return 2
-    details, hard, acknowledged, result = run(target, trust_ref)
-    console = Console()
-    report(console, result, details, acknowledged)
+    if exempt:
+        console.print(f"  ~ {len(exempt)} line(s) exempt via {NOSTYLE_TAG}", markup=False)
     total = sum(details.values())
     if not hard and not total: console.print("FEASIBLE (score=0.00)")
     else: console.print(f"INFEASIBLE (score={total:.2f}) hard={hard}")
