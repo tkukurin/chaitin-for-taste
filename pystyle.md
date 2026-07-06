@@ -64,7 +64,8 @@ prev_branch=$(git branch --show-current)
 git checkout -b lm/fix/<name>
 f=<path_to_file.py>
 git add $f; git commit -m <one-liner...>
-uv run --script codestyle.py $f
+# --trust-ref $prev_branch honors human waivers already on the base branch
+uv run --script codestyle.py --trust-ref $prev_branch $f
 (... fixing ...)
 git add $f; git commit -m <one-liner plus bullet points of changes>
 # Go back to previous branch and checkout the latest state of the file
@@ -74,10 +75,38 @@ git checkout lm/fix/<name> -- $f
 git log $prev_branch..lm/fix/<name> --patch -- $f
 ```
 
+## Waivers (intent, not debt)
+
+Some flagged issues are deliberate: config data literals kept wide,
+IO in the imperative shell, a pragmatic long line. These are intent,
+not debt. Record intent in the commit that authors the offending line,
+via a trailer:
+
+```
+<commit subject>
+
+Style-Allow: line_length
+Style-Allow: impure_fns
+```
+
+`codestyle.py --trust-ref <ref>` git-blames each offending line, reads
+that commit's `Style-Allow:` trailers, and drops the metric to an
+`ACKNOWLEDGED` section (cost 0) — but ONLY when the commit is reachable
+from `<ref>`. A metric is acknowledged only if EVERY line charging it is
+waived, so a new unwaived violation of the same metric still surfaces.
+
+CRITICAL: waivers are the human's assertion of intent. You (the agent)
+MUST NOT author `Style-Allow:` trailers to make a file pass. If you
+believe an issue is intentional, SURFACE it and ask — do not waive it.
+The `--trust-ref $prev_branch` convention enforces this mechanically:
+trailers you add on the working branch are unreachable from the base
+ref and will NOT be honored.
+
 REMINDER.
 This is a broad heuristic capturing our preferences.
 We do not need 100% adherence.
 HOWEVER: prefer to treat errors as style debt to fix.
+Treat genuine intent as a waiver to REQUEST, not a metric to silence.
 
 After fixing codestyle errors, report to the user.
 What did you change? Did you possibly reward-hack?

@@ -22,6 +22,8 @@ from radon.raw import analyze
 from rich.console import Console
 from rich.table import Table
 
+STYLE_ALLOW_RE = re.compile(r"^\s*Style-Allow:\s*([A-Za-z_][\w]*)", re.MULTILINE)
+
 BANNER_RE = re.compile(r"^\s*#\s*[-=]{3,}")
 PATH_HACK_RE = re.compile(
     r"^\s*(?:sys\.path\.(?:insert|append)|import\s+importlib\.util"
@@ -35,7 +37,10 @@ IO_ATTRS = {
     "to_csv", "to_excel", "to_json", "to_parquet",
     "write_bytes", "write_text",
 }
-MUTATING_METHODS = {"add", "append", "clear", "discard", "extend", "insert", "pop", "remove", "reverse", "sort", "update"}
+MUTATING_METHODS = {
+    "add", "append", "clear", "discard", "extend", "insert",
+    "pop", "remove", "reverse", "sort", "update",
+}
 LOGGING_NAMES = {"logging", "logger", "log"}
 COMP_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
@@ -626,20 +631,124 @@ def metric_values(result: Analysis) -> dict[str, float]:
     }
 
 
-is_protocol_hook = lambda n: n.startswith("visit_") or (n.startswith("__") and n.endswith("__"))
+def is_protocol_hook(n: str) -> bool:
+    return n.startswith("visit_") or (n.startswith("__") and n.endswith("__"))
 
 
 def shallow_functions(functions: list[FunctionMetric]) -> list[FunctionMetric]:
     return [fn for fn in functions if fn.shallow and not is_protocol_hook(fn.name)]
 
 
-def score(result: Analysis) -> tuple[dict[str, float], list[str]]:
+def git_lines(args: list[str]) -> list[str]:
+    proc = subprocess.run(
+        ["git", *args], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        return []
+    return proc.stdout.splitlines()
+
+
+def commit_waivers(sha: str) -> set[str]:
+    body = "\n".join(git_lines(["show", "-s", "--format=%B", sha]))
+    return set(STYLE_ALLOW_RE.findall(body))
+
+
+def line_commits(path: Path) -> dict[int, str]:
+    out: dict[int, str] = {}
+    lineno = 0
+    for line in git_lines(["blame", "-p", "HEAD", "--", str(path)]):
+        head = line.split(" ")
+        if len(head) >= 3 and len(head[0]) == 40 and head[0].isalnum():
+            lineno = int(head[2])
+            out[lineno] = head[0]
+    return out
+
+
+def is_ancestor(sha: str, trust_ref: str) -> bool:
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", sha, trust_ref]
+    ).returncode == 0
+
+
+def reachable(trust_ref: str, shas: set[str]) -> set[str]:
+    return {sha for sha in shas if is_ancestor(sha, trust_ref)}
+
+
+def trusted_lines(path: Path, trust_ref: str) -> dict[int, set[str]]:
+    blame = line_commits(path)
+    shas = set(blame.values())
+    trusted = reachable(trust_ref, shas)
+    waivers = {sha: commit_waivers(sha) for sha in trusted}
+    return {ln: waivers.get(sha, set()) for ln, sha in blame.items()}
+
+
+def issue_lines(issues: list[str]) -> list[int]:
+    out: list[int] = []
+    for text in issues:
+        if m := re.search(r"L(\d+)", text):
+            out.append(int(m.group(1)))
+    return out
+
+
+def over_target(attr: str):
+    return lambda fn, name: getattr(fn, attr) > LIMITS[name].target
+
+
+FN_METRIC_PREDS = {
+    "cyclomatic": over_target("cc"),
+    "cognitive": over_target("cognitive"),
+    "nesting": over_target("nesting"),
+    "fn_loc": over_target("loc"),
+    "impure_fns": lambda fn, name: not fn.pure,
+    "hidden_global_fns": lambda fn, name: any(
+        "hidden global read" in r for r in fn.reasons
+    ),
+}
+
+
+def function_anchors(result: Analysis) -> dict[str, list[int]]:
+    fns = result.functions
+    anchors = {
+        name: [fn.line for fn in fns if pred(fn, name)]
+        for name, pred in FN_METRIC_PREDS.items()
+    }
+    anchors["shallow_fns"] = [f.line for f in shallow_functions(fns)]
+    return anchors
+
+
+def offending_lines(result: Analysis, lines: list[str]) -> dict[str, list[int]]:
+    anchors = function_anchors(result)
+    anchors["line_length"] = [
+        i for i, line in enumerate(lines, 1)
+        if len(line) == result.max_line > LIMITS["line_length"].target
+    ]
+    for key, texts in result.issues.items():
+        anchors[key] = issue_lines(texts)
+    return {name: sorted(set(v)) for name, v in anchors.items() if v}
+
+
+def acknowledged_metrics(
+    path: Path, anchors: dict[str, list[int]], trust_ref: str
+) -> dict[str, list[int]]:
+    allow = trusted_lines(path, trust_ref)
+    out: dict[str, list[int]] = {}
+    for name, charged in anchors.items():
+        if charged and all(name in allow.get(ln, ()) for ln in charged):
+            out[name] = charged
+    return out
+
+
+def score(
+    result: Analysis, acknowledged: dict[str, list[int]] | None = None
+) -> tuple[dict[str, float], list[str]]:
     details = score_functions(result.functions) | score_file(result)
     details |= {
         name: cost(name, val)
         for name, val in metric_values(result).items()
     }
     details["ruff"] = ruff_cost(result.ruff)
+    for name in acknowledged or {}:
+        details[name] = 0.0
     hard = [name for name, value in details.items() if math.isinf(value)]
     return details, hard
 
@@ -766,13 +875,17 @@ def summary_table(result: Analysis) -> Table:
     }
     for name, value in rows.items():
         table.add_row(name, str(value))
-    for key in display_issue_keys:
+    for key in DISPLAY_ISSUE_KEYS:
         label = key.replace("_", " ").title()
         table.add_row(label, str(len(result.issues[key])))
     return table
 
 
-display_issue_keys = "large_cells", "complex_cells", "string_split_lists", "tuple_specs", "dense_comps", "repeated_transforms", "bare_asserts", "intent_docstring", "banners", "path_hacks", "import_names", "ruff"
+DISPLAY_ISSUE_KEYS = (
+    "large_cells", "complex_cells", "string_split_lists", "tuple_specs",
+    "dense_comps", "repeated_transforms", "bare_asserts", "intent_docstring",
+    "banners", "path_hacks", "import_names", "ruff",
+)
 
 
 def score_table(details: dict[str, float]) -> Table:
@@ -789,7 +902,10 @@ def score_table(details: dict[str, float]) -> Table:
 
 def function_table(result: Analysis) -> Table:
     table = Table(title="Per-Function Metrics", show_header=True)
-    for col in ("Function", "Line", "LOC", "Impl", "Args", "Depth", "CC", "Cogn", "Nest", "Pure", "Shallow"): table.add_column(col)
+    cols = ("Function", "Line", "LOC", "Impl", "Args", "Depth",
+            "CC", "Cogn", "Nest", "Pure", "Shallow")
+    for col in cols:
+        table.add_column(col)
     for fn in sorted(result.functions, key=lambda x: -x.loc):
         reported_shallow = fn.shallow and not is_protocol_hook(fn.name)
         table.add_row(
@@ -808,28 +924,65 @@ def function_table(result: Analysis) -> Table:
     return table
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print("Usage: uv run --script codestyle.py <file.py>", file=sys.stderr)
-        return 2
-    target = Path(argv[1])
-    if not target.exists():
-        print(f"File not found: {target}", file=sys.stderr)
-        return 2
-    source = target.read_text()
-    ruff = subprocess.run(["uvx", "ruff", "check", "--select", "I,F401,F841", "--output-format", "json", str(target)], capture_output=True, text=True)
-    result = analyze_source(target, source, parse_ruff(ruff.stdout))
-    details, hard = score(result)
-    console = Console()
-    reports = [
-        summary_table(result),
-        score_table(details),
-        function_table(result),
+def parse_args(argv: list[str]) -> tuple[Path | None, str | None]:
+    trust_ref = None
+    rest = []
+    it = iter(argv[1:])
+    for arg in it:
+        if arg == "--trust-ref":
+            trust_ref = next(it, None)
+        else:
+            rest.append(arg)
+    return (Path(rest[0]) if rest else None), trust_ref
+
+
+def acknowledged_report(acknowledged: dict[str, list[int]]) -> list[str]:
+    return [
+        f"ACK {name}: {', '.join(f'L{ln}' for ln in at)} (Style-Allow, trusted)"
+        for name, at in sorted(acknowledged.items())
     ]
-    for item in reports:
+
+
+def run(target: Path, trust_ref: str | None) -> tuple[dict[str, float], list[str], dict[str, list[int]], Analysis]:
+    source = target.read_text()
+    ruff = subprocess.run(
+        ["uvx", "ruff", "check", "--select", "I,F401,F841",
+         "--output-format", "json", str(target)],
+        capture_output=True, text=True,
+    )
+    result = analyze_source(target, source, parse_ruff(ruff.stdout))
+    lines = source.splitlines()
+    acknowledged = {}
+    if trust_ref:
+        anchors = offending_lines(result, lines)
+        acknowledged = acknowledged_metrics(target, anchors, trust_ref)
+    details, hard = score(result, acknowledged)
+    return details, hard, acknowledged, result
+
+
+def report(
+    console: Console, result: Analysis,
+    details: dict[str, float], acknowledged: dict[str, list[int]],
+) -> None:
+    for item in (summary_table(result), score_table(details), function_table(result)):
         console.print(item)
     for hint in hints(result):
         console.print(f"  > {hint}")
+    for line in acknowledged_report(acknowledged):
+        console.print(f"  ~ {line}")
+
+
+def main(argv: list[str]) -> int:
+    target, trust_ref = parse_args(argv)
+    if target is None:
+        print("Usage: uv run --script codestyle.py [--trust-ref REF] <file.py>", file=sys.stderr)
+        return 2
+    if not target.exists():
+        print(f"File not found: {target}", file=sys.stderr)
+        return 2
+    details, hard, acknowledged, result = run(target, trust_ref)
+    console = Console()
+    report(console, result, details, acknowledged)
     total = sum(details.values())
     if not hard and not total: console.print("FEASIBLE (score=0.00)")
     else: console.print(f"INFEASIBLE (score={total:.2f}) hard={hard}")
