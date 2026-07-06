@@ -1,0 +1,7 @@
+[project]
+name = "tkstyleskill"
+version = "0.1.0"
+description = "Demo skill with soft feedback"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
