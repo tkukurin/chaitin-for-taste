@@ -13,7 +13,7 @@ import math
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from radon.complexity import cc_visit
@@ -21,6 +21,8 @@ from radon.metrics import h_visit, mi_visit
 from radon.raw import analyze
 from rich.console import Console
 from rich.table import Table
+
+NOSTYLE_TAG = "[tknostyle]"
 
 BANNER_RE = re.compile(r"^\s*#\s*[-=]{3,}")
 PATH_HACK_RE = re.compile(
@@ -35,7 +37,10 @@ IO_ATTRS = {
     "to_csv", "to_excel", "to_json", "to_parquet",
     "write_bytes", "write_text",
 }
-MUTATING_METHODS = {"add", "append", "clear", "discard", "extend", "insert", "pop", "remove", "reverse", "sort", "update"}
+MUTATING_METHODS = {
+    "add", "append", "clear", "discard", "extend", "insert",
+    "pop", "remove", "reverse", "sort", "update",
+}
 LOGGING_NAMES = {"logging", "logger", "log"}
 COMP_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
@@ -626,11 +631,78 @@ def metric_values(result: Analysis) -> dict[str, float]:
     }
 
 
-is_protocol_hook = lambda n: n.startswith("visit_") or (n.startswith("__") and n.endswith("__"))
+def is_protocol_hook(n: str) -> bool:
+    return n.startswith("visit_") or (n.startswith("__") and n.endswith("__"))
 
 
 def shallow_functions(functions: list[FunctionMetric]) -> list[FunctionMetric]:
     return [fn for fn in functions if fn.shallow and not is_protocol_hook(fn.name)]
+
+
+def git_lines(args: list[str]) -> list[str]:
+    proc = subprocess.run(
+        ["git", *args], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        return []
+    return proc.stdout.splitlines()
+
+
+def commit_is_tagged(sha: str, cache: dict[str, bool]) -> bool:
+    if sha not in cache:
+        body = "\n".join(git_lines(["show", "-s", "--format=%B", sha]))
+        cache[sha] = NOSTYLE_TAG in body
+    return cache[sha]
+
+
+# lines authored by a [tknostyle] commit are exempt from all checks; latest
+# blame wins, so a later untagged edit re-arms the line
+def exempt_lines(path: Path) -> set[int]:
+    lineno = 0
+    tagged: set[int] = set()
+    cache: dict[str, bool] = {}
+    for line in git_lines(["blame", "-p", "HEAD", "--", str(path)]):
+        head = line.split(" ")
+        if len(head) >= 3 and len(head[0]) == 40 and head[0].isalnum():
+            lineno = int(head[2])
+            if commit_is_tagged(head[0], cache):
+                tagged.add(lineno)
+    return tagged
+
+
+def issue_line(text: str) -> int | None:
+    m = re.search(r"L(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def fn_covered(fn: FunctionMetric, exempt: set[int]) -> bool:
+    return set(range(fn.line, fn.line + max(fn.loc, 1))) <= exempt
+
+
+def issue_kept(text: str, exempt: set[int]) -> bool:
+    ln = issue_line(text)
+    return ln is None or ln not in exempt
+
+
+def max_line_length(lines: list[str], exempt: set[int]) -> int:
+    kept = (len(line) for i, line in enumerate(lines, 1) if i not in exempt)
+    return max(kept, default=0)
+
+
+def filter_exempt(result: Analysis, lines: list[str], exempt: set[int]) -> Analysis:
+    if not exempt:
+        return result
+    kept_fns = [fn for fn in result.functions if not fn_covered(fn, exempt)]
+    kept_issues = {
+        name: [t for t in texts if issue_kept(t, exempt)]
+        for name, texts in result.issues.items()
+    }
+    return replace(
+        result,
+        functions=kept_fns,
+        issues=kept_issues,
+        max_line=max_line_length(lines, exempt),
+    )
 
 
 def score(result: Analysis) -> tuple[dict[str, float], list[str]]:
@@ -766,13 +838,17 @@ def summary_table(result: Analysis) -> Table:
     }
     for name, value in rows.items():
         table.add_row(name, str(value))
-    for key in display_issue_keys:
+    for key in DISPLAY_ISSUE_KEYS:
         label = key.replace("_", " ").title()
         table.add_row(label, str(len(result.issues[key])))
     return table
 
 
-display_issue_keys = "large_cells", "complex_cells", "string_split_lists", "tuple_specs", "dense_comps", "repeated_transforms", "bare_asserts", "intent_docstring", "banners", "path_hacks", "import_names", "ruff"
+DISPLAY_ISSUE_KEYS = (
+    "large_cells", "complex_cells", "string_split_lists", "tuple_specs",
+    "dense_comps", "repeated_transforms", "bare_asserts", "intent_docstring",
+    "banners", "path_hacks", "import_names", "ruff",
+)
 
 
 def score_table(details: dict[str, float]) -> Table:
@@ -789,7 +865,10 @@ def score_table(details: dict[str, float]) -> Table:
 
 def function_table(result: Analysis) -> Table:
     table = Table(title="Per-Function Metrics", show_header=True)
-    for col in ("Function", "Line", "LOC", "Impl", "Args", "Depth", "CC", "Cogn", "Nest", "Pure", "Shallow"): table.add_column(col)
+    cols = ("Function", "Line", "LOC", "Impl", "Args", "Depth",
+            "CC", "Cogn", "Nest", "Pure", "Shallow")
+    for col in cols:
+        table.add_column(col)
     for fn in sorted(result.functions, key=lambda x: -x.loc):
         reported_shallow = fn.shallow and not is_protocol_hook(fn.name)
         table.add_row(
@@ -817,19 +896,25 @@ def main(argv: list[str]) -> int:
         print(f"File not found: {target}", file=sys.stderr)
         return 2
     source = target.read_text()
-    ruff = subprocess.run(["uvx", "ruff", "check", "--select", "I,F401,F841", "--output-format", "json", str(target)], capture_output=True, text=True)
-    result = analyze_source(target, source, parse_ruff(ruff.stdout))
+    ruff = subprocess.run(
+        ["uvx", "ruff", "check", "--select", "I,F401,F841",
+         "--output-format", "json", str(target)],
+        capture_output=True, text=True,
+    )
+    exempt = exempt_lines(target)
+    result = filter_exempt(
+        analyze_source(target, source, parse_ruff(ruff.stdout)),
+        source.splitlines(),
+        exempt,
+    )
     details, hard = score(result)
     console = Console()
-    reports = [
-        summary_table(result),
-        score_table(details),
-        function_table(result),
-    ]
-    for item in reports:
+    for item in (summary_table(result), score_table(details), function_table(result)):
         console.print(item)
     for hint in hints(result):
         console.print(f"  > {hint}")
+    if exempt:
+        console.print(f"  ~ {len(exempt)} line(s) exempt via {NOSTYLE_TAG}", markup=False)
     total = sum(details.values())
     if not hard and not total: console.print("FEASIBLE (score=0.00)")
     else: console.print(f"INFEASIBLE (score={total:.2f}) hard={hard}")

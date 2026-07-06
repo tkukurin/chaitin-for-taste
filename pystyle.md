@@ -82,3 +82,7 @@ HOWEVER: prefer to treat errors as style debt to fix.
 After fixing codestyle errors, report to the user.
 What did you change? Did you possibly reward-hack?
 Did you capture the spirit of our guidelines?
+
+Exemptions.
+To exempt deliberate code, put `[tknostyle]` in the message of the commit that authors those lines; 
+`codestyle.py` blames each line and drops tagged ones from all checks (only add tags when the user allows it).
