@@ -1,7 +1,8 @@
 # chaitin-for-taste
 
 > [!IMPORTANT]
-> We buildin' the environment as we [chaitin].
+> forget prompts write damn objective metrics. 
+> let the semantic layer guard against reward hacking
 
 _LMs lack taste_.
 Herein lies a demo[^1] implementing various formalizms to teach coding taste in particular.
@@ -16,6 +17,8 @@ Some motivation:
 
 The rule following is ICL the feedbacks are (RL) environments.
 [Gradient descent on a different substrate][iclearn].
+
+
 
 [^1]: recursive self improvement comes separate
 
