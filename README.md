@@ -1,7 +1,8 @@
 # chaitin-for-taste
 
 > [!IMPORTANT]
-> We buildin' the environment as we [chaitin].
+> forget prompts write damn objective metrics. 
+> let the semantic layer guard against reward hacking
 
 _LMs lack taste_.
 Herein lies a demo[^1] implementing various formalizms to teach coding taste in particular.
