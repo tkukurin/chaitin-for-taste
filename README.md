@@ -65,7 +65,7 @@ but executes the `test_noncompositional.py` benchmarks exceptionally fast.
 </details>
 
 <details>
-<summary>Example response from Gemini 3.1 (**acknowledges** reward hacking caught by metrics)</summary>
+<summary>Example response from Gemini 3.1 (<b>acknowledges</b> reward hacking caught by metrics)</summary>
 
 ### The What changed?
 1. **Removed Separator Comments:** Deleted all visual banners like `# --------------------------------------------------------------------------` as requested.
