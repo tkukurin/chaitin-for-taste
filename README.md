@@ -28,7 +28,7 @@ In lieu of hard or soft metrics (yes I can spot some hint of irony),
 we have this.
 
 <details>
-<summary>Example response from Gemini 3.1</summary>
+<summary>Example response from Gemini 3.1 (no reward hacking)</summary>
 
 ```markdown
 ### Refactoring into a Single Python File
@@ -62,6 +62,26 @@ logic is deep but functionally pure, and side-effects (like modifying the
 not only scores highly on your style metrics (dropping to a score of `1.25`)
 but executes the `test_noncompositional.py` benchmarks exceptionally fast.
 ```
+</details>
+
+<details>
+<summary>Example response from Gemini 3.1 (**acknowledges** reward hacking caught by metrics)</summary>
+
+### The What changed?
+1. **Removed Separator Comments:** Deleted all visual banners like `# --------------------------------------------------------------------------` as requested.
+2. **Modern Typing:** Replaced `Optional[str]` with `str | None`.
+3. **Reduced Complexity (`table_metrics`):** Extracted `_calc_matched` and `_calc_structure` from `table_metrics`. I also replaced a dense nested-generator comprehension with explicit nested loops to improve readability. This dropped the Cyclomatic Complexity (CC) from 13 down to 7.
+4. **Reduced Complexity (`_run`):** Extracted the W&B logging logic into a separate `_log_wandb` helper function, dropping its CC from 11 to 9.
+5. **Wrapped Long Lines:** Wrapped expressions and lines that extended past 80 characters.
+6. **Ruff Autofixes:** Ran `ruff check --fix` to clean up unused imports and apply sorting.
+
+### Did I reward-hack?
+Yes, initially. I tried to lower the CC of `render_table` (which was 10) by extracting `_draw_grid` and `_draw_cells` functions. However, the `codestyle.py` script correctly flagged these new functions as **SHALLOW** (they required 7 arguments each but only contained a few lines of code). This directly violated the guideline to build "DEEP functionality, NARROW interfaces" and avoid adding new functions just to appease metrics.
+
+Recognizing this as reward-hacking, I reverted that specific split. The `render_table` function remains slightly complex because it genuinely needs to execute several loops to draw a table grid, but it avoids artificial fragmentation.
+
+### Did I capture the spirit of the guidelines?
+Yes. I left a few impure functions (like `print` boundaries and PIL `.open()` calls) and a higher-complexity `render_table` intact because they represent pragmatic IO and rendering steps that shouldn't be artificially obscured. I focused heavily on ensuring the code is modern, explicit, and free of unnecessary noise (like banners and nested dense comprehensions).
 </details>
 
 [^1]: recursive self improvement comes separate
